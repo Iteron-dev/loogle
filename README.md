@@ -90,6 +90,20 @@ and forwards any arguments after `--` to the loogle binary.
 At the path `/json?q=…` (instead of `/?q=…`), the result is returned in JSON
 format. No stability of the format is guaranteed at this point.
 
+Docker
+------
+
+The image builds the loogle binary only; mount a Lake project (same toolchain)
+to search:
+
+    docker build -t loogle .
+    docker run --rm -p 8088:8088 \
+      -v /path/to/project:/project:ro \
+      -e LOOGLE_PROJECT_DIR=/project -e LOOGLE_MODULE=MyModule loogle
+    curl 'http://localhost:8088/json?q=Real.sin'
+
+`LOOGLE_HOST`, `LOOGLE_PORT`, and `LOOGLE_WORKERS` are read from the environment.
+
 Zulip bot
 ---------
 
