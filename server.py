@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import argparse
 import urllib
 import subprocess
@@ -11,6 +11,8 @@ import time
 import re
 import os
 import select
+import threading
+import queue
 
 
 def parse_args():
@@ -21,25 +23,34 @@ def parse_args():
                     "`-- --module Init.Data.List.Basic --max-results 50`).",
         allow_abbrev=False,
     )
-    parser.add_argument("--host", default="localhost",
-                        help="HTTP listen address (default: localhost)")
-    parser.add_argument("--port", type=int, default=8088,
-                        help="HTTP listen port (default: 8088)")
-    parser.add_argument("--loogle-bin", default=".lake/build/bin/loogle",
+    parser.add_argument("--host",
+                        default=os.environ.get("LOOGLE_HOST", "localhost"),
+                        help="HTTP listen address (default: localhost, "
+                             "or $LOOGLE_HOST)")
+    parser.add_argument("--port", type=int,
+                        default=int(os.environ.get("LOOGLE_PORT", "8088")),
+                        help="HTTP listen port (default: 8088, or $LOOGLE_PORT)")
+    parser.add_argument("--workers", type=int,
+                        default=int(os.environ.get("LOOGLE_WORKERS", "2")),
+                        help="Number of parallel loogle backends "
+                             "(default: 2, or $LOOGLE_WORKERS)")
+    parser.add_argument("--loogle-bin",
+                        default=os.environ.get("LOOGLE_BIN",
+                                               ".lake/build/bin/loogle"),
                         help="Path to the loogle binary (default: "
-                             ".lake/build/bin/loogle)")
-    parser.add_argument("--project-dir", default=None,
-                        help="Lake project directory to serve. When set, the "
-                             "loogle subprocess is invoked via `lake -d <dir> "
-                             "env <loogle-bin> ...` so it sees the project's "
-                             "LEAN_PATH, and the project's name + git "
-                             "revision are shown in the page footer.")
+                             ".lake/build/bin/loogle, or $LOOGLE_BIN)")
+    parser.add_argument("--project-dir",
+                        default=os.environ.get("LOOGLE_PROJECT_DIR"),
+                        help="Lake project directory to serve (or "
+                             "$LOOGLE_PROJECT_DIR). When set, loogle runs via "
+                             "`lake -d <dir> env <loogle-bin> ...`.")
     return parser.parse_known_args()
 
 
 args, loogle_extra_args = parse_args()
 hostName = args.host
 serverPort = args.port
+numWorkers = max(1, args.workers)
 loogleBin = args.loogle_bin
 projectDir = args.project_dir
 # Strip a leading "--" separator if the user used one to delimit forwarded args.
@@ -142,8 +153,10 @@ examples = [
     "Real.sqrt ?a * Real.sqrt ?a",
 ]
 
-class Loogle():
+class LoogleWorker():
+    # One `loogle --interactive` process; serves one query at a time.
     def __init__(self):
+        self.lock = threading.Lock()
         self.start()
 
     def start(self):
@@ -158,45 +171,65 @@ class Loogle():
         )
 
     def do_query(self, query):
-        if self.starting:
-            r, w, e = select.select([ self.loogle.stdout ], [], [], 0)
-            if self.loogle.stdout in r:
-                greeting = self.loogle.stdout.readline()
-                if greeting != b"Loogle is ready.\n":
+        with self.lock:
+            if self.starting:
+                r, w, e = select.select([ self.loogle.stdout ], [], [], 0)
+                if self.loogle.stdout in r:
+                    greeting = self.loogle.stdout.readline()
+                    if greeting != b"Loogle is ready.\n":
+                        self.loogle.kill() # just to be sure
+                        self.start()
+                        return {"error": "The backend process did not send greeting, killing and restarting..."}
+                    else:
+                        self.starting = False
+                else:
+                    return {"error": "The backend process is starting up, please try again later..."}
+            try:
+                self.loogle.stdin.write(bytes(query, "utf8"));
+                self.loogle.stdin.write(b"\n");
+                self.loogle.stdin.flush();
+                output_json = self.loogle.stdout.readline()
+                output = json.loads(output_json)
+                return output
+            except (IOError, json.JSONDecodeError) as e:
+                time.sleep(5) # to allow the process to die
+                code = self.loogle.poll()
+                if code == -31:
+                    sys.stderr.write(f"Backend died trying to escape the sandbox.\n")
+                    self.start()
+                    return {"error":
+                        f"Backend died trying to escape the sandbox. Restarting..."
+                    }
+                if code is not None:
+                    sys.stderr.write(f"Backend died with code {code}.\n")
+                    self.start()
+                    return {"error":
+                        f"The backend process died with code {code}. Restarting..."
+                    }
+                else:
+                    sys.stderr.write(f"Backend did not respond ({e}).\n")
                     self.loogle.kill() # just to be sure
                     self.start()
-                    return {"error": "The backend process did not send greeting, killing and restarting..."}
-                else:
-                    self.starting = False
-            else:
-                return {"error": "The backend process is starting up, please try again later..."}
+                    return {"error": "The backend process did not respond, killing and restarting..."}
+
+
+class Loogle():
+    # Pool of LoogleWorker backends; query() hands out a free one, blocking if none.
+    def __init__(self, num_workers=1):
+        self.num_workers = max(1, num_workers)
+        self._available = queue.Queue()
+        self.workers = []
+        for _ in range(self.num_workers):
+            worker = LoogleWorker()
+            self.workers.append(worker)
+            self._available.put(worker)
+
+    def do_query(self, query):
+        worker = self._available.get()
         try:
-            self.loogle.stdin.write(bytes(query, "utf8"));
-            self.loogle.stdin.write(b"\n");
-            self.loogle.stdin.flush();
-            output_json = self.loogle.stdout.readline()
-            output = json.loads(output_json)
-            return output
-        except (IOError, json.JSONDecodeError) as e:
-            time.sleep(5) # to allow the process to die
-            code = self.loogle.poll()
-            if code == -31:
-                sys.stderr.write(f"Backend died trying to escape the sandbox.\n")
-                self.start()
-                return {"error":
-                    f"Backend died trying to escape the sandbox. Restarting..."
-                }
-            if code is not None:
-                sys.stderr.write(f"Backend died with code {code}.\n")
-                self.start()
-                return {"error":
-                    f"The backend process died with code {code}. Restarting..."
-                }
-            else:
-                sys.stderr.write(f"Backend did not respond ({e}).\n")
-                self.loogle.kill() # just to be sure
-                self.start()
-                return {"error": "The backend process did not respond, killing and restarting..."}
+            return worker.do_query(query)
+        finally:
+            self._available.put(worker)
 
     def query(self, query):
         m_queries.inc()
@@ -213,7 +246,7 @@ class Loogle():
 
 
 
-loogle = Loogle()
+loogle = Loogle(numWorkers)
 
 # link formatting
 def locallink(query):
@@ -605,8 +638,9 @@ class MyHandler(HandlerBase):
             pass
 
 if __name__ == "__main__":
-    webServer = HTTPServer((hostName, serverPort), MyHandler)
-    print("Server started http://%s:%s" % (hostName, serverPort), flush=True)
+    webServer = ThreadingHTTPServer((hostName, serverPort), MyHandler)
+    print("Server started http://%s:%s (%d backend worker(s))"
+          % (hostName, serverPort, loogle.num_workers), flush=True)
 
     try:
         webServer.serve_forever()
